@@ -1,6 +1,7 @@
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
+from app.exceptions import InsufficientStockError
 
 from app.models import Customer, Order, OrderItem, Product
 from app.schemas import OrderCreate
@@ -36,10 +37,7 @@ def place_order(payload: OrderCreate, db: Session) -> Order:
             )
 
         if product.stock < quantity:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Insufficient stock for product {product_id}",
-            )
+            raise InsufficientStockError()
 
         products[product_id] = product
 

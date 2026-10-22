@@ -1,22 +1,98 @@
-from fastapi import FastAPI, Depends, Response, status, HTTPException, Query
-from sqlalchemy.orm import Session
-from app.schemas import OrderCreate, OrderOut
-from app.services import place_order
 
+import logging
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    status,
+)
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from app.database import Base, engine, get_db
-from app.models import Product, Customer, Order
-from app.schemas import ProductCreate, ProductOut, ProductUpdate, CustomerCreate, CustomerOut, OrderOut
-from sqlalchemy.exc import IntegrityError
+from app.exceptions import (
+    CustomerNotFoundError,
+    DuplicateCustomerEmailError,
+    InsufficientStockError,
+    InvalidOrderStateError,
+    OrderAPIError,
+    OrderAlreadyCancelledError,
+    OrderNotFoundError,
+    ProductNotFoundError,
+)
+from app.logging_config import configure_logging
+from app.models import Customer, Order, Product
+from app.schemas import (
+    CustomerCreate,
+    CustomerOut,
+    OrderCreate,
+    OrderOut,
+    ProductCreate,
+    ProductOut,
+    ProductUpdate,
+)
+from app.services import place_order
 
-import app.models
+# Configure logging and initialize the application.
+configure_logging()
+logger = logging.getLogger(__name__)
 
+# Create tables for local development.
 Base.metadata.create_all(bind=engine)
+
 app = FastAPI(title="Orders API")
+
+
+@app.on_event("startup")
+def log_startup():
+    logger.info("Orders API started")
+
+
+# Map custom errors to HTTP status codes and messages.
+ERROR_RESPONSES = {
+    CustomerNotFoundError: (404, "Customer not found"),
+    ProductNotFoundError: (404, "Product not found"),
+    OrderNotFoundError: (404, "Order not found"),
+    InsufficientStockError: (400, "Insufficient stock"),
+    DuplicateCustomerEmailError: (409, "Customer email already exists"),
+    OrderAlreadyCancelledError: (409, "Order is already cancelled"),
+    InvalidOrderStateError: (409, "Invalid order state"),
+}
+
+
+@app.exception_handler(OrderAPIError)
+async def handle_order_api_error(request: Request, exc: OrderAPIError):
+    status_code, detail = ERROR_RESPONSES.get(
+        type(exc),
+        (400, "Request could not be processed"),
+    )
+
+    # Log expected business errors without exposing internal details.
+    logger.warning(
+        "Request failed: %s %s | %s - %s",
+        request.method,
+        request.url.path,
+        type(exc).__name__,
+        detail,
+    )
+
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": detail},
+    )
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# Product endpoints
 
 @app.post(
     "/products",
@@ -37,7 +113,9 @@ def create_product(
     db.commit()
     db.refresh(product)
 
+    logger.info("Product created: id=%s", product.id)
     return product
+
 
 @app.get("/products/{product_id}", response_model=ProductOut)
 def get_product(product_id: int, db: Session = Depends(get_db)):
@@ -48,10 +126,11 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
 
     return product
 
+
 @app.get("/products", response_model=list[ProductOut])
 def get_products(db: Session = Depends(get_db)):
-    products = db.query(Product).all()
-    return products
+    return db.query(Product).all()
+
 
 @app.put("/products/{product_id}", response_model=ProductOut)
 def update_product(
@@ -71,7 +150,9 @@ def update_product(
     db.commit()
     db.refresh(product)
 
+    logger.info("Product updated: id=%s", product.id)
     return product
+
 
 @app.delete(
     "/products/{product_id}",
@@ -84,16 +165,16 @@ def delete_product(
     product = db.get(Product, product_id)
 
     if product is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Product not found",
-        )
+        raise HTTPException(status_code=404, detail="Product not found")
 
     db.delete(product)
     db.commit()
 
+    logger.info("Product deleted: id=%s", product_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+
+# Customer endpoints
 
 @app.post(
     "/customers",
@@ -114,13 +195,11 @@ def create_customer(
     try:
         db.commit()
         db.refresh(new_customer)
-    except IntegrityError:
+    except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Customer email already exists",
-        )
+        raise DuplicateCustomerEmailError() from exc
 
+    logger.info("Customer created: id=%s", new_customer.id)
     return new_customer
 
 
@@ -133,11 +212,14 @@ def get_customer(
 
     if customer is None:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
+            status_code=404,
             detail="Customer not found",
         )
 
     return customer
+
+
+# Order endpoints
 
 @app.post(
     "/orders",
@@ -148,23 +230,19 @@ def create_order(
     payload: OrderCreate,
     db: Session = Depends(get_db),
 ):
-    return place_order(payload, db)
+    order = place_order(payload, db)
+    logger.info("Order created: id=%s", order.id)
+    return order
+
 
 @app.get("/orders/{order_id}", response_model=OrderOut)
-def get_order(
-    order_id: int,
-    db: Session = Depends(get_db),
-):
+def get_order(order_id: int, db: Session = Depends(get_db)):
     order = db.get(Order, order_id)
 
     if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
-        )
+        raise HTTPException(status_code=404, detail="Order not found")
 
     return order
-
 
 
 @app.get("/orders", response_model=list[OrderOut])
@@ -200,24 +278,22 @@ def cancel_order(
     order = db.get(Order, order_id)
 
     if order is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Order not found",
-        )
+        raise HTTPException(status_code=404, detail="Order not found")
 
     if order.status == "CANCELLED":
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=409,
             detail="Order is already cancelled",
         )
 
     if order.status != "PLACED":
         raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
+            status_code=409,
             detail="Only placed orders can be cancelled",
         )
 
     try:
+        # Restore product stock and cancel the order in one transaction.
         for item in order.items:
             product = db.get(Product, item.product_id)
 
@@ -228,8 +304,10 @@ def cancel_order(
         db.commit()
         db.refresh(order)
 
-        return order
-
     except Exception:
         db.rollback()
+        logger.exception("Failed to cancel order: id=%s", order_id)
         raise
+
+    logger.info("Order cancelled: id=%s", order.id)
+    return order
