@@ -1,5 +1,16 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from decimal import Decimal
+from uuid import uuid4
+
+
+from app.exceptions import InsufficientStockError, OrderAlreadyCancelledError
+from app.models import Customer, Order, OrderItem, Product
+from app.schemas import OrderCreate
+from app.services import place_order
 
 import pytest
+from sqlalchemy import event
 
 
 @pytest.fixture()
@@ -134,7 +145,7 @@ def test_order_rejects_insufficient_stock(client, order_setup):
 
     response = client.post("/orders", json=payload)
 
-    assert response.status_code == 400
+    assert response.status_code == 409
     assert response.json()["detail"] == "Insufficient stock"
 
     product_response = client.get(
@@ -164,7 +175,7 @@ def test_duplicate_product_items_cannot_bypass_stock_check(
 
     response = client.post("/orders", json=payload)
 
-    assert response.status_code == 400
+    assert response.status_code == 409
     assert response.json()["detail"] == "Insufficient stock"
 
     product_response = client.get(
@@ -354,3 +365,244 @@ def test_create_order_rejects_invalid_payload(client, payload):
     response = client.post("/orders", json=payload)
 
     assert response.status_code == 422
+
+
+def test_concurrent_orders_cannot_oversell_stock(
+    independent_session_factory,
+):
+    SessionLocal = independent_session_factory
+
+    # Create committed records visible to both sessions.
+    setup_db = SessionLocal()
+    customer = Customer(
+        name="Concurrency Test Customer",
+        email=f"concurrency-{uuid4().hex}@example.com",
+    )
+    product = Product(
+        name="Last Unit",
+        price=Decimal("10.00"),
+        stock=1,
+    )
+
+    setup_db.add_all([customer, product])
+    setup_db.commit()
+
+    customer_id = customer.id
+    product_id = product.id
+    setup_db.close()
+
+    payload = OrderCreate(
+        customer_id=customer_id,
+        items=[{"product_id": product_id, "quantity": 1}],
+    )
+
+    # Synchronize both workers immediately before they read the product row.
+    # With SELECT ... FOR UPDATE, PostgreSQL serializes access to this row.
+    # Without the lock, both workers can observe stock=1 and oversell it.
+    product_read_barrier = Barrier(2)
+
+    def is_target_product_read(statement):
+        normalized = statement.lower()
+        return "from products" in normalized and "where products.id" in normalized
+
+    def synchronize_product_read(conn, cursor, statement, parameters, context, executemany):
+        if is_target_product_read(statement):
+            product_read_barrier.wait(timeout=10)
+
+    def synchronize_unlocked_read_result(conn, cursor, statement, parameters, context, executemany):
+        normalized = statement.lower()
+        # If FOR UPDATE is removed, make both SELECTs finish before either
+        # worker continues to decrement stock. With FOR UPDATE, the second
+        # SELECT waits for the first transaction, so do not barrier here.
+        if is_target_product_read(statement) and "for update" not in normalized:
+            product_read_barrier.wait(timeout=10)
+
+    database_engine = SessionLocal.kw["bind"]
+    event.listen(database_engine, "before_cursor_execute", synchronize_product_read)
+    event.listen(database_engine, "after_cursor_execute", synchronize_unlocked_read_result)
+
+    def attempt_order():
+        db = SessionLocal()
+        try:
+            place_order(payload, db)
+            return "success"
+        except InsufficientStockError:
+            return "insufficient_stock"
+        finally:
+            db.close()
+
+    try:
+        try:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        lambda _: attempt_order(),
+                        range(2),
+                    )
+                )
+        finally:
+            # These barriers are only for the two competing worker queries.
+            # Remove the listeners before verification/cleanup queries run.
+            event.remove(
+                database_engine,
+                "before_cursor_execute",
+                synchronize_product_read,
+            )
+            event.remove(
+                database_engine,
+                "after_cursor_execute",
+                synchronize_unlocked_read_result,
+            )
+
+        # Only one order can purchase the final unit.
+        assert results.count("success") == 1
+        assert results.count("insufficient_stock") == 1
+
+        verify_db = SessionLocal()
+        try:
+            remaining_product = verify_db.get(Product, product_id)
+
+            assert remaining_product.stock == 0
+
+            orders = (
+                verify_db.query(Order)
+                .filter(Order.customer_id == customer_id)
+                .all()
+            )
+            assert len(orders) == 1
+        finally:
+            verify_db.close()
+
+    finally:
+        # Remove test records in foreign-key-safe order.
+        cleanup_db = SessionLocal()
+        try:
+            order_ids = [
+                order.id
+                for order in cleanup_db.query(Order)
+                .filter(Order.customer_id == customer_id)
+                .all()
+            ]
+
+            if order_ids:
+                cleanup_db.query(OrderItem).filter(
+                    OrderItem.order_id.in_(order_ids)
+                ).delete(synchronize_session=False)
+
+                cleanup_db.query(Order).filter(
+                    Order.id.in_(order_ids)
+                ).delete(synchronize_session=False)
+
+            cleanup_db.query(Product).filter(
+                Product.id == product_id
+            ).delete(synchronize_session=False)
+
+            cleanup_db.query(Customer).filter(
+                Customer.id == customer_id
+            ).delete(synchronize_session=False)
+
+            cleanup_db.commit()
+        except Exception:
+            cleanup_db.rollback()
+            raise
+        finally:
+            cleanup_db.close()
+
+def test_concurrent_cancellations_restore_stock_only_once(
+    independent_session_factory,
+):
+    SessionLocal = independent_session_factory
+
+    # Create a committed order with one product.
+    setup_db = SessionLocal()
+    customer = Customer(
+        name="Cancellation Concurrency Customer",
+        email=f"cancel-concurrency-{uuid4().hex}@example.com",
+    )
+    product = Product(
+        name="Cancellation Test Product",
+        price=Decimal("10.00"),
+        stock=9,
+    )
+    setup_db.add_all([customer, product])
+    setup_db.commit()
+    setup_db.refresh(customer)
+    setup_db.refresh(product)
+
+    order = Order(customer_id=customer.id, status="PLACED")
+    setup_db.add(order)
+    setup_db.flush()
+
+    order_item = OrderItem(
+        order_id=order.id,
+        product_id=product.id,
+        quantity=1,
+        unit_price=Decimal("10.00"),
+    )
+    setup_db.add(order_item)
+
+    # Simulate stock already deducted when the order was placed.
+    product.stock = 8
+    setup_db.commit()
+
+    order_id = order.id
+    product_id = product.id
+    setup_db.close()
+
+    def attempt_cancellation():
+        db = SessionLocal()
+        try:
+            from app.services import cancel_order
+
+            cancel_order(order_id, db)
+            return "success"
+        except OrderAlreadyCancelledError:
+            return "already_cancelled"
+        finally:
+            db.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda _: attempt_cancellation(),
+                    range(2),
+                )
+            )
+
+        assert results.count("success") == 1
+        assert results.count("already_cancelled") == 1
+
+        verify_db = SessionLocal()
+        try:
+            final_product = verify_db.get(Product, product_id)
+            final_order = verify_db.get(Order, order_id)
+
+            assert final_product.stock == 9
+            assert final_order.status == "CANCELLED"
+        finally:
+            verify_db.close()
+
+    finally:
+        cleanup_db = SessionLocal()
+        try:
+            cleanup_order = cleanup_db.get(Order, order_id)
+            if cleanup_order is not None:
+                cleanup_db.delete(cleanup_order)
+                cleanup_db.flush()
+
+            cleanup_product = cleanup_db.get(Product, product_id)
+            if cleanup_product is not None:
+                cleanup_db.delete(cleanup_product)
+                cleanup_db.flush()
+
+            cleanup_customer = cleanup_db.get(Customer, customer.id)
+            if cleanup_customer is not None:
+                cleanup_db.delete(cleanup_customer)
+
+            cleanup_db.commit()
+        except Exception:
+            cleanup_db.rollback()
+            raise
+        finally:
+            cleanup_db.close()

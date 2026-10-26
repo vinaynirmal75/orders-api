@@ -74,3 +74,7 @@ def client(db_session):
             yield test_client
     finally:
         app.dependency_overrides.clear()
+
+@pytest.fixture()
+def independent_session_factory():
+    return TestingSessionLocal

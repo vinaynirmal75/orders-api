@@ -13,6 +13,8 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from app.exceptions import ProductInUseError
+
 
 from app.database import Base, engine, get_db
 from app.exceptions import (
@@ -36,21 +38,25 @@ from app.schemas import (
     ProductOut,
     ProductUpdate,
 )
+from app.services import cancel_order as cancel_order_service
 from app.services import place_order
+from contextlib import asynccontextmanager
 
 # Configure logging and initialize the application.
 configure_logging()
 logger = logging.getLogger(__name__)
 
-# Create tables for local development.
-Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Orders API")
-
-
-@app.on_event("startup")
-def log_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Create missing tables for a fresh local development database.
+    # Use migrations (e.g. Alembic) for production schema changes.
+    Base.metadata.create_all(bind=engine)
     logger.info("Orders API started")
+    yield
+
+
+app = FastAPI(title="Orders API", lifespan=lifespan)
 
 
 # Map custom errors to HTTP status codes and messages.
@@ -58,10 +64,11 @@ ERROR_RESPONSES = {
     CustomerNotFoundError: (404, "Customer not found"),
     ProductNotFoundError: (404, "Product not found"),
     OrderNotFoundError: (404, "Order not found"),
-    InsufficientStockError: (400, "Insufficient stock"),
+    InsufficientStockError: (409, "Insufficient stock"),
     DuplicateCustomerEmailError: (409, "Customer email already exists"),
     OrderAlreadyCancelledError: (409, "Order is already cancelled"),
     InvalidOrderStateError: (409, "Invalid order state"),
+    ProductInUseError: (409, "Product is referenced by an existing order"),
 }
 
 
@@ -71,6 +78,8 @@ async def handle_order_api_error(request: Request, exc: OrderAPIError):
         type(exc),
         (400, "Request could not be processed"),
     )
+
+    detail = str(exc) or detail
 
     # Log expected business errors without exposing internal details.
     logger.warning(
@@ -128,9 +137,18 @@ def get_product(product_id: int, db: Session = Depends(get_db)):
 
 
 @app.get("/products", response_model=list[ProductOut])
-def get_products(db: Session = Depends(get_db)):
-    return db.query(Product).all()
-
+def get_products(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+    ):
+    return (
+        db.query(Product)
+        .order_by(Product.id)
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
 
 @app.put("/products/{product_id}", response_model=ProductOut)
 def update_product(
@@ -161,18 +179,23 @@ def update_product(
 def delete_product(
     product_id: int,
     db: Session = Depends(get_db),
-):
+    ):
     product = db.get(Product, product_id)
 
     if product is None:
         raise HTTPException(status_code=404, detail="Product not found")
 
-    db.delete(product)
-    db.commit()
+    try:
+        db.delete(product)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise ProductInUseError(
+            "Cannot delete a product referenced by an existing order"
+        ) from exc
 
     logger.info("Product deleted: id=%s", product_id)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
-
 
 # Customer endpoints
 
@@ -275,39 +298,7 @@ def cancel_order(
     order_id: int,
     db: Session = Depends(get_db),
 ):
-    order = db.get(Order, order_id)
-
-    if order is None:
-        raise HTTPException(status_code=404, detail="Order not found")
-
-    if order.status == "CANCELLED":
-        raise HTTPException(
-            status_code=409,
-            detail="Order is already cancelled",
-        )
-
-    if order.status != "PLACED":
-        raise HTTPException(
-            status_code=409,
-            detail="Only placed orders can be cancelled",
-        )
-
-    try:
-        # Restore product stock and cancel the order in one transaction.
-        for item in order.items:
-            product = db.get(Product, item.product_id)
-
-            if product is not None:
-                product.stock += item.quantity
-
-        order.status = "CANCELLED"
-        db.commit()
-        db.refresh(order)
-
-    except Exception:
-        db.rollback()
-        logger.exception("Failed to cancel order: id=%s", order_id)
-        raise
+    order = cancel_order_service(order_id, db)
 
     logger.info("Order cancelled: id=%s", order.id)
     return order

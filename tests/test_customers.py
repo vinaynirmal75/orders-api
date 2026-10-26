@@ -55,6 +55,8 @@ def test_duplicate_customer_email_returns_conflict(
     [
         {"name": "", "email": "test@example.com"},
         {"name": "Test Customer", "email": "x"},
+        {"name": "Test Customer", "email": "not-an-email"},
+        {"name": "Test Customer", "email": "missing-domain@"},
         {"name": "Test Customer"},
         {"email": "test@example.com"},
     ],

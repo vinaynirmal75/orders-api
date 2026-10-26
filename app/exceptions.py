@@ -29,3 +29,8 @@ class OrderAlreadyCancelledError(OrderAPIError):
 
 class InvalidOrderStateError(OrderAPIError):
     pass
+
+
+class ProductInUseError(OrderAPIError):
+    """Raised when attempting to delete a product referenced by an order."""
+    pass
